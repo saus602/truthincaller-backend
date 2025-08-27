@@ -9,3 +9,4 @@ librosa
 scikit-learn
 requests
 eyed3
+matplotlib
