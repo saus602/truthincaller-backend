@@ -12,30 +12,36 @@ import tempfile, os, json
 app = FastAPI()
 
 # -------------------------
-# Enable CORS (for Rocket frontend or any client)
+# Enable CORS
 # -------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict to ["http://127.0.0.1:8001"] later
+    allow_origins=["*"],  # Change to ["http://127.0.0.1:8001"] if you want to lock it later
     allow_credentials=True,
-    allow_methods=["*"],   # GET, POST, OPTIONS, etc.
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -------------------------
-# Health check endpoint
+# Health check
 # -------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 # -------------------------
-# OpenAI client (hardcoded key for now)
+# OpenAI client (use env variable, NOT hardcoded)
 # -------------------------
-client = OpenAI(api_key="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")  # <-- replace with your real key
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("❌ OPENAI_API_KEY environment variable not set!")
+
+print("🔑 DEBUG: API key loaded (first 8 chars):", OPENAI_API_KEY[:8])  # 👈 Debug print
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # -------------------------
-# Convert uploaded file to WAV
+# Convert file to WAV
 # -------------------------
 def convert_to_wav(file_path: str) -> str:
     wav_path = file_path.rsplit(".", 1)[0] + ".wav"
@@ -44,7 +50,7 @@ def convert_to_wav(file_path: str) -> str:
     return wav_path
 
 # -------------------------
-# Voice Analysis
+# Voice analysis
 # -------------------------
 def analyze_voice(file_path: str):
     try:
@@ -77,7 +83,7 @@ def analyze_voice(file_path: str):
         return {"error": str(e)}
 
 # -------------------------
-# Analyze Endpoint
+# Analyze endpoint
 # -------------------------
 @app.post("/analyze")
 async def analyze(file: UploadFile):
@@ -99,12 +105,12 @@ async def analyze(file: UploadFile):
 
         # Step 2: GPT JSON credibility analysis
         analysis = client.chat.completions.create(
-            model="gpt-5",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a credibility analysis assistant. Always return only valid JSON."},
                 {"role": "user", "content": f"Analyze this transcript:\n{transcript.text}\n\nReturn strictly JSON with keys: summary, red_flags, truth_score (0-100)."}
             ],
-            response_format={"type": "json_object"}  # <--- forces JSON output
+            response_format={"type": "json_object"}
         )
 
         text_report = json.loads(analysis.choices[0].message.content)
@@ -117,13 +123,13 @@ async def analyze(file: UploadFile):
         # Step 4: Final Truth Meter
         credibility_score = int((text_score * 0.6) + (voice_score * 0.4))
 
-        # Cleanup temp files
+        # Cleanup
         os.remove(audio_path)
         os.remove(wav_path)
 
         return {
             "transcript": transcript.text,
-            "text_report": text_report,       # parsed JSON object
+            "text_report": text_report,
             "voice_report": voice_report,
             "final_truth_meter": credibility_score
         }
