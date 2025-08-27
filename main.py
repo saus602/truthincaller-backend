@@ -136,3 +136,7 @@ async def analyze(file: UploadFile):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+@app.get("/check-key")
+async def check_key():
+    return {"key_start": OPENAI_API_KEY[:8], "length": len(OPENAI_API_KEY)}
