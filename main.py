@@ -16,7 +16,7 @@ app = FastAPI()
 # -------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to ["http://127.0.0.1:8001"] if you want to lock it later
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,13 +30,17 @@ async def health():
     return {"status": "ok"}
 
 # -------------------------
-# OpenAI client (use env variable, NOT hardcoded)
+# OpenAI client with key check
 # -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("❌ OPENAI_API_KEY environment variable not set!")
 
-print("🔑 DEBUG: API key loaded (first 8 chars):", OPENAI_API_KEY[:8])  # 👈 Debug print
+# Warn if it's the wrong type of key
+if OPENAI_API_KEY.startswith("sk-proj-"):
+    print("⚠️ WARNING: You are using a project key (sk-proj-...). Use a standard key (sk-...) instead!")
+elif OPENAI_API_KEY.startswith("sk-"):
+    print("✅ Correct OpenAI API key type detected.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -136,7 +140,3 @@ async def analyze(file: UploadFile):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
-@app.get("/check-key")
-async def check_key():
-    return {"key_start": OPENAI_API_KEY[:8], "length": len(OPENAI_API_KEY)}
