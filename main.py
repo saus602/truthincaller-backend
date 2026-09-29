@@ -1,22 +1,31 @@
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
-from pyAudioAnalysis import audioBasicIO, ShortTermFeatures
 from pydub import AudioSegment
-import numpy as np
-import tempfile, os, json
+import os
+import tempfile
+
+from app.pipeline import analyze_session, segments_from_whisper_verbose
 
 # -------------------------
 # FastAPI app
 # -------------------------
-app = FastAPI()
+app = FastAPI(
+    title="Correlation Grid API",
+    description=(
+        "Backend for the Correlation Grid decision-support instrument: turns call "
+        "audio into an acoustic-stress series and a linguistic-simplification series, "
+        "aligned side by side, for a trained professional to review. Not a "
+        "truthfulness verdict — see /session/analyze's `disclaimer` field."
+    ),
+)
 
 # -------------------------
 # Enable CORS
 # -------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,113 +39,83 @@ async def health():
     return {"status": "ok"}
 
 # -------------------------
-# OpenAI client with key check
+# OpenAI client (used for transcription only — the two-axis analysis below is
+# our own DSP + linguistic pipeline, not an LLM call)
 # -------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("❌ OPENAI_API_KEY environment variable not set!")
+_client: OpenAI | None = None
+if OPENAI_API_KEY:
+    if OPENAI_API_KEY.startswith("sk-proj-"):
+        print("WARNING: using a project key (sk-proj-...); a standard key (sk-...) is expected.")
+    _client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    print("WARNING: OPENAI_API_KEY not set — /session/analyze will fail until it is configured.")
 
-# Warn if it's the wrong type of key
-if OPENAI_API_KEY.startswith("sk-proj-"):
-    print("⚠️ WARNING: You are using a project key (sk-proj-...). Use a standard key (sk-...) instead!")
-elif OPENAI_API_KEY.startswith("sk-"):
-    print("✅ Correct OpenAI API key type detected.")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+def _get_client() -> OpenAI:
+    if _client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Transcription is unavailable: OPENAI_API_KEY is not configured on this server.",
+        )
+    return _client
+
 
 # -------------------------
-# Convert file to WAV
+# Convert file to WAV (mono 16-bit PCM, as app.acoustic expects)
 # -------------------------
 def convert_to_wav(file_path: str) -> str:
-    wav_path = file_path.rsplit(".", 1)[0] + ".wav"
-    audio = AudioSegment.from_file(file_path)
+    wav_path = file_path.rsplit(".", 1)[0] + ".converted.wav"
+    audio = AudioSegment.from_file(file_path).set_channels(1).set_sample_width(2)
     audio.export(wav_path, format="wav")
     return wav_path
 
+
 # -------------------------
-# Voice analysis
+# Session analysis endpoint — replaces the old single-score /analyze.
+#
+# The previous version of this endpoint returned a "truth_score" / "deception_risk"
+# verdict. That framing was dropped along with the "Truth in Caller" name: the
+# product now presents two raw signal axes (acoustic stress, linguistic
+# simplification) plus where they diverge together, and leaves the read to the
+# professional using it — see the product spec's "Repositioning & Naming" and
+# "UX Concept: The Live Correlation Grid" sections.
 # -------------------------
-def analyze_voice(file_path: str):
+@app.post("/session/analyze")
+async def session_analyze(file: UploadFile):
+    client = _get_client()
+    audio_path = None
+    wav_path = None
     try:
-        [Fs, x] = audioBasicIO.read_audio_file(file_path)
-        x = audioBasicIO.stereo_to_mono(x)
-
-        F, f_names = ShortTermFeatures.feature_extraction(
-            x, Fs, 0.050*Fs, 0.025*Fs
-        )
-
-        pitch = np.mean(F[0])
-        energy = np.mean(F[1])
-        entropy = np.mean(F[2])
-        flux = np.mean(F[3])
-
-        stress_level = "High" if entropy > 5 else "Moderate"
-        deception_risk = "Possible" if flux > 0.2 else "Low"
-        voice_score = int(100 - (entropy * 10))
-
-        return {
-            "avg_pitch": float(pitch),
-            "avg_energy": float(energy),
-            "avg_entropy": float(entropy),
-            "avg_flux": float(flux),
-            "stress_level": stress_level,
-            "deception_risk": deception_risk,
-            "voice_score": max(0, min(voice_score, 100))
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# -------------------------
-# Analyze endpoint
-# -------------------------
-@app.post("/analyze")
-async def analyze(file: UploadFile):
-    try:
-        # Save uploaded file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file.filename.split('.')[-1]}") as tmp:
+        suffix = file.filename.split(".")[-1] if "." in file.filename else "audio"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
             tmp.write(await file.read())
             audio_path = tmp.name
 
-        # Convert to WAV
         wav_path = convert_to_wav(audio_path)
 
-        # Step 1: Transcription
         with open(wav_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
+            transcription = client.audio.transcriptions.create(
                 model="whisper-1",
-                file=audio_file
+                file=audio_file,
+                response_format="verbose_json",
             )
 
-        # Step 2: GPT JSON credibility analysis
-        analysis = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a credibility analysis assistant. Always return only valid JSON."},
-                {"role": "user", "content": f"Analyze this transcript:\n{transcript.text}\n\nReturn strictly JSON with keys: summary, red_flags, truth_score (0-100)."}
-            ],
-            response_format={"type": "json_object"}
-        )
+        segments = segments_from_whisper_verbose(transcription)
+        if not segments:
+            # fall back to a single segment spanning the whole clip so the
+            # linguistic axis still has something to score
+            segments = [{"start": 0.0, "end": 0.0, "text": getattr(transcription, "text", "")}]
 
-        text_report = json.loads(analysis.choices[0].message.content)
-        text_score = int(text_report.get("truth_score", 70))
+        result = analyze_session(wav_path, segments)
+        result["raw_transcript"] = getattr(transcription, "text", "")
+        return result
 
-        # Step 3: Voice analysis
-        voice_report = analyze_voice(wav_path)
-        voice_score = voice_report.get("voice_score", 60) if isinstance(voice_report, dict) else 60
-
-        # Step 4: Final Truth Meter
-        credibility_score = int((text_score * 0.6) + (voice_score * 0.4))
-
-        # Cleanup
-        os.remove(audio_path)
-        os.remove(wav_path)
-
-        return {
-            "transcript": transcript.text,
-            "text_report": text_report,
-            "voice_report": voice_report,
-            "final_truth_meter": credibility_score
-        }
-
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+    finally:
+        for p in (audio_path, wav_path):
+            if p and os.path.exists(p):
+                os.remove(p)

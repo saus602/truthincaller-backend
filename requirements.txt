@@ -2,12 +2,6 @@ fastapi
 uvicorn
 openai
 pydub
-pyAudioAnalysis
 numpy
 scipy
-librosa
-scikit-learn
-requests
-eyed3
-matplotlib
 python-multipart
